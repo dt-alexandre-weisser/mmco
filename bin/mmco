@@ -1,0 +1,296 @@
+#!/bin/zsh
+# mmco: fetch, clean and check out a branch of a mapped local repository, then open it in VS Code.
+# Single source of truth for the whole flow. mmco.app and the Chrome extension only call this.
+#
+# USAGE
+#   mmco <owner/repo> [branch]      resolve <owner/repo> through the mapping table, check out [branch]
+#   mmco --path <folder> [branch]   same, on an explicit folder (no mapping lookup)
+#   mmco --settings                 open the mapping table (mmco.app), falls back to --config
+#   mmco --config                   open the JSON config in VS Code
+#   mmco --default-pre              print the default pre-checkout block
+#   mmco --default-post <folder>    print the default post-checkout block for that folder
+#   mmco --help
+#
+# FLOW  (each step is logged to ~/Library/Logs/mmco.log)
+#   1. resolve the mapping row (unknown repo: folder picker, saved with the default blocks)
+#   2. dirty tracked files: dialog Overwrite / Abort. Overwrite = git reset --hard, untracked kept
+#   3. git fetch --all --prune
+#   4. run the row's pre-checkout block (default: branch cleanup, see --default-pre)
+#   5. check out the branch, always hard-reset to origin. Unknown branch or none given: origin/<default>
+#      branch live in another worktree: warning dialog, then --ignore-other-worktrees
+#   6. run the row's post-checkout block (default: dependency install for the detected package manager)
+#   7. open VS Code on the folder, notify
+#
+# Blocks run with zsh, cwd = the repo, with MMCO_REPO, MMCO_PATH, MMCO_BRANCH, MMCO_DEFAULT_BRANCH set.
+# MMCO_NO_OPEN=1 skips the VS Code step, MMCO_ASSUME=go|abort answers the dialogs (scripted use).
+
+set -o pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mmco"
+CONFIG="$CONFIG_DIR/config.json"
+LOG_DIR="$HOME/Library/Logs"
+LOG="$LOG_DIR/mmco.log"
+TITLE="mmco"
+
+# ---------------------------------------------------------------- defaults
+
+default_pre() {
+  cat <<'EOF'
+# mmco default pre-checkout block. Runs after `git fetch --all --prune`, inside the repo.
+# MMCO_DEFAULT_BRANCH = branch behind origin/HEAD, MMCO_BRANCH = branch about to be checked out.
+git checkout --quiet --detach "origin/$MMCO_DEFAULT_BRANCH"
+
+protect() { grep -vx -- "$MMCO_BRANCH" | grep -vx -- "$MMCO_DEFAULT_BRANCH"; }
+
+# Local branches whose upstream is gone: their remote branch was deleted (PR merged or closed).
+git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads \
+  | awk '$2 == "[gone]" { print $1 }' | protect \
+  | while read -r b; do git branch -D "$b" || echo "mmco: could not delete $b"; done
+
+# Local branches whose PR is merged. Rebase and squash merges rewrite SHAs, so ask GitHub.
+merged=$(gh pr list --state merged --limit 300 --json headRefName --jq '.[].headRefName' 2>/dev/null)
+if [ -n "$merged" ]; then
+  git for-each-ref --format='%(refname:short)' refs/heads \
+    | grep -Fx -f <(printf '%s\n' "$merged") | protect \
+    | while read -r b; do git branch -D "$b" || echo "mmco: could not delete $b"; done
+else
+  echo "mmco: gh unavailable or not authenticated, merged-PR cleanup skipped"
+fi
+EOF
+}
+
+default_post() {
+  local dir="$1"
+  if [ -f "$dir/pnpm-lock.yaml" ]; then
+    echo "pnpm install --config.confirmModulesPurge=false"
+  elif [ -f "$dir/yarn.lock" ]; then
+    echo "yarn install"
+  elif [ -f "$dir/package-lock.json" ]; then
+    echo "npm install"
+  fi
+}
+
+# ---------------------------------------------------------------- helpers
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+die() { log "ERROR: $*"; notify "$*"; exit 1; }
+
+# osascript escapes: backslash and double quote.
+as_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+notify() {
+  osascript -e "display notification \"$(as_str "$1")\" with title \"$TITLE\" subtitle \"$(as_str "${2:-}")\"" >/dev/null 2>&1 || true
+}
+
+# confirm <message> <ok-button> -> exit 0 when the user picks <ok-button>, 1 on Abort.
+# MMCO_ASSUME=go|abort answers every dialog without showing it (scripted use).
+confirm() {
+  local msg="$1" ok="$2"
+  case "${MMCO_ASSUME:-}" in
+    go) log "dialog auto-answered: $ok"; return 0 ;;
+    abort) log "dialog auto-answered: Abort"; return 1 ;;
+  esac
+  osascript >/dev/null 2>&1 <<EOF
+display dialog "$(as_str "$msg")" with title "$TITLE" buttons {"Abort", "$(as_str "$ok")"} default button "Abort" cancel button "Abort" with icon caution
+EOF
+}
+
+ensure_config() {
+  mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+  [ -f "$CONFIG" ] || echo '{ "version": 1, "mappings": [] }' > "$CONFIG"
+}
+
+# Interactive shells get nvm and Homebrew from .zshrc; a launch from mmco.app does not.
+setup_path() {
+  export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/tools/bin:$PATH:/Applications/Visual Studio Code.app/Contents/Resources/app/bin"
+  if [ -s "$HOME/.nvm/nvm.sh" ]; then
+    source "$HOME/.nvm/nvm.sh" --no-use
+    nvm use default >/dev/null 2>&1 || true
+  fi
+}
+
+lookup_row() {
+  jq -r --arg repo "$1" '.mappings[] | select((.repo | ascii_downcase) == ($repo | ascii_downcase)) | .path' "$CONFIG" | head -n1
+}
+
+row_field() {
+  jq -r --arg repo "$1" --arg f "$2" '.mappings[] | select((.repo | ascii_downcase) == ($repo | ascii_downcase)) | .[$f] // ""' "$CONFIG" | head -n1
+}
+
+add_row() {
+  local repo="$1" dir="$2"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg repo "$repo" --arg path "$dir" --arg pre "$(default_pre)" --arg post "$(default_post "$dir")" \
+    '.mappings += [{ repo: $repo, path: $path, preCheckout: $pre, postCheckout: $post }]' "$CONFIG" > "$tmp" \
+    && mv "$tmp" "$CONFIG"
+}
+
+pick_folder() {
+  osascript -e "POSIX path of (choose folder with prompt \"mmco: local folder for $(as_str "$1")\")" 2>/dev/null | sed 's:/$::'
+}
+
+open_settings() {
+  if open "mmco://settings" 2>/dev/null; then exit 0; fi
+  echo "mmco.app is not installed, opening the JSON config instead." >&2
+  open_config
+}
+
+open_config() {
+  ensure_config
+  if command -v code >/dev/null 2>&1; then code "$CONFIG"; else open -t "$CONFIG"; fi
+  exit 0
+}
+
+run_block() {
+  local name="$1" block="$2"
+  [ -z "${block//[[:space:]]/}" ] && { log "$name block: empty, skipped"; return 0; }
+  log "$name block: start"
+  ( cd "$MMCO_PATH" && zsh -c "$block" )
+  local rc=$?
+  log "$name block: exit $rc"
+  return $rc
+}
+
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# ---------------------------------------------------------------- args
+
+REPO="" DIR="" BRANCH=""
+case "${1:-}" in
+  -h|--help) usage 0 ;;
+  --settings) open_settings ;;
+  --config) open_config ;;
+  --default-pre) default_pre; exit 0 ;;
+  --default-post) default_post "${2:?folder required}"; exit 0 ;;
+  --path) DIR="${2:?folder required}"; BRANCH="${3:-}" ;;
+  "") usage 1 ;;
+  -*) echo "unknown option $1" >&2; usage 1 ;;
+  *) REPO="$1"; BRANCH="${2:-}" ;;
+esac
+
+ensure_config
+setup_path
+exec > >(tee -a "$LOG") 2>&1
+log "run: repo='${REPO:-<path>}' path='${DIR:-<mapped>}' branch='${BRANCH:-<default>}'"
+
+# ---------------------------------------------------------------- 1. mapping
+
+if [ -z "$DIR" ]; then
+  DIR=$(lookup_row "$REPO")
+  if [ -z "$DIR" ]; then
+    DIR=$(pick_folder "$REPO")
+    [ -z "$DIR" ] && die "no folder picked for $REPO, aborted"
+    add_row "$REPO" "$DIR"
+    log "mapping added: $REPO -> $DIR"
+  fi
+fi
+[ -d "$DIR/.git" ] || [ -f "$DIR/.git" ] || die "$DIR is not a git repository"
+DIR=$(cd "$DIR" && pwd -P) || die "cannot cd into $DIR"
+
+export MMCO_REPO="$REPO" MMCO_PATH="$DIR" MMCO_BRANCH="$BRANCH"
+cd "$DIR" || die "cannot cd into $DIR"
+if [ -f .nvmrc ] && command -v nvm >/dev/null 2>&1; then nvm use >/dev/null 2>&1 || true; fi
+
+# ---------------------------------------------------------------- 2. dirty tree
+
+DIRTY=$(git status --porcelain --untracked-files=no)
+if [ -n "$DIRTY" ]; then
+  log "dirty tracked files:"; echo "$DIRTY"
+  if confirm "$DIR has uncommitted changes:
+
+$(echo "$DIRTY" | head -n 12)$([ "$(echo "$DIRTY" | wc -l)" -gt 12 ] && echo '
+…')
+
+Overwrite discards these edits (git reset --hard). Untracked files are kept." "Overwrite"; then
+    git reset --hard --quiet || die "git reset --hard failed"
+    log "tracked changes discarded"
+  else
+    die "aborted: $DIR has uncommitted changes"
+  fi
+fi
+
+# ---------------------------------------------------------------- 3. fetch
+
+git fetch --all --prune --quiet || die "git fetch failed in $DIR"
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's:^origin/::')
+if [ -z "$DEFAULT_BRANCH" ]; then
+  git remote set-head origin --auto >/dev/null 2>&1
+  DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's:^origin/::')
+fi
+[ -n "$DEFAULT_BRANCH" ] || die "cannot determine origin's default branch in $DIR"
+export MMCO_DEFAULT_BRANCH="$DEFAULT_BRANCH"
+log "default branch: $DEFAULT_BRANCH"
+
+# ---------------------------------------------------------------- 4. pre-checkout block
+
+if [ -n "$REPO" ]; then PRE=$(row_field "$REPO" preCheckout); else PRE=$(default_pre); fi
+run_block "pre-checkout" "$PRE" || die "pre-checkout block failed (see $LOG)"
+
+# ---------------------------------------------------------------- 5. checkout
+
+WARNINGS=()
+TARGET="$BRANCH"
+if [ -n "$TARGET" ]; then
+  HAS_REMOTE=$(git rev-parse --verify --quiet "refs/remotes/origin/$TARGET" >/dev/null && echo 1)
+  HAS_LOCAL=$(git rev-parse --verify --quiet "refs/heads/$TARGET" >/dev/null && echo 1)
+  if [ -z "$HAS_REMOTE" ] && [ -z "$HAS_LOCAL" ]; then
+    WARNINGS+=("branch $TARGET not found, landed on origin/$DEFAULT_BRANCH")
+    TARGET=""
+  fi
+fi
+
+if [ -z "$TARGET" ]; then
+  git checkout --quiet --detach "origin/$DEFAULT_BRANCH" || die "checkout of origin/$DEFAULT_BRANCH failed"
+  LANDED="origin/$DEFAULT_BRANCH (detached)"
+else
+  CHECKOUT_FLAGS=()
+  OTHER_WT=""
+  for wt in ${(f)"$(git worktree list --porcelain | awk -v ref="branch refs/heads/$TARGET" '
+      /^worktree / { wt = substr($0, 10) } $0 == ref { print wt }')"}; do
+    [ "$(cd "$wt" 2>/dev/null && pwd -P)" = "$DIR" ] || OTHER_WT="$wt"
+  done
+  if [ -n "$OTHER_WT" ]; then
+    WT_NAME=$(basename "$OTHER_WT")
+    confirm "$TARGET is already checked out in worktree \"$WT_NAME\":
+$OTHER_WT
+
+Continuing forces the branch into $DIR as well. The two checkouts then share one branch ref, and a commit in one leaves the other's HEAD stale." "Continue" \
+      || die "aborted: $TARGET is checked out in worktree $WT_NAME ($OTHER_WT)"
+    CHECKOUT_FLAGS+=(--ignore-other-worktrees)
+    WARNINGS+=("forced: $TARGET is also checked out in worktree $WT_NAME")
+  fi
+
+  if [ -n "$HAS_LOCAL" ]; then
+    git checkout --quiet "${CHECKOUT_FLAGS[@]}" "$TARGET" || die "checkout of $TARGET failed"
+    if [ -n "$HAS_REMOTE" ]; then
+      git branch --quiet --set-upstream-to="origin/$TARGET" "$TARGET" >/dev/null 2>&1
+      git reset --hard --quiet "origin/$TARGET" || die "reset to origin/$TARGET failed"
+    fi
+  else
+    git checkout --quiet "${CHECKOUT_FLAGS[@]}" -b "$TARGET" --track "origin/$TARGET" || die "checkout of origin/$TARGET failed"
+  fi
+  LANDED="$TARGET"
+  [ -z "$HAS_REMOTE" ] && WARNINGS+=("$TARGET has no origin counterpart, local branch kept as is")
+fi
+log "checked out: $LANDED"
+
+# ---------------------------------------------------------------- 6. post-checkout block
+
+if [ -n "$REPO" ]; then POST=$(row_field "$REPO" postCheckout); else POST=$(default_post "$DIR"); fi
+run_block "post-checkout" "$POST" || WARNINGS+=("post-checkout block failed (see $LOG)")
+
+# ---------------------------------------------------------------- 7. open + notify
+
+if [ -z "${MMCO_NO_OPEN:-}" ]; then
+  if command -v code >/dev/null 2>&1; then code "$DIR"; else open -a "Visual Studio Code" "$DIR"; fi
+fi
+
+SUMMARY="$(basename "$DIR") on $LANDED"
+if [ ${#WARNINGS[@]} -gt 0 ]; then
+  for w in "${WARNINGS[@]}"; do log "WARNING: $w"; done
+  notify "$(printf '%s. ' "${WARNINGS[@]}")" "$SUMMARY"
+else
+  notify "Ready in VS Code." "$SUMMARY"
+fi
+log "done: $SUMMARY"

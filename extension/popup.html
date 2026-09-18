@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>mmco</title>
+  <style>
+    body { width: 300px; margin: 0; padding: 12px; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2328; }
+    h1 { margin: 0 0 8px; font-size: 14px; }
+    .row { display: flex; justify-content: space-between; gap: 8px; margin: 4px 0; }
+    .label { color: #59636e; }
+    .value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; text-align: right; }
+    input { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 5px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; border: 1px solid #d0d7de; border-radius: 6px; }
+    button { margin-top: 10px; width: 100%; padding: 6px 0; font-weight: 600; color: #fff; background: #0969da; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
+    button:disabled { background: #8c959f; cursor: default; }
+    .hint { margin-top: 8px; color: #59636e; font-size: 12px; }
+    footer { margin-top: 12px; padding-top: 8px; border-top: 1px solid #d0d7de; display: flex; justify-content: space-between; font-size: 12px; }
+    a { color: #0969da; text-decoration: none; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>mmco</h1>
+  <div class="row"><span class="label">Repository</span><span class="value" id="repo">–</span></div>
+  <div class="row"><span class="label">Branch</span><span class="value" id="branch">–</span></div>
+  <input id="branch-input" placeholder="branch (empty = default branch)" spellcheck="false">
+  <button id="go" disabled>Checkout locally</button>
+  <p class="hint" id="hint"></p>
+  <footer>
+    <a id="settings">Settings…</a>
+    <a id="config">Config file</a>
+  </footer>
+  <script src="popup.js"></script>
+</body>
+</html>
