@@ -82,10 +82,20 @@ struct MappingEditor: View {
             )
             BlockSection(
                 title: "Post-checkout",
-                subtitle: "Runs inside the folder after the branch switch, before VS Code opens. Same variables. A non-zero exit is reported but VS Code still opens.",
+                subtitle: "Runs inside the folder after the branch switch, in the terminal chosen below, so its output stays visible. Same variables.",
                 text: $mapping.postCheckout,
                 reset: { mapping.postCheckout = store.defaultPost(for: mapping.path) }
             )
+            Section {
+                Toggle("Run it in a Terminal window instead of VS Code", isOn: $mapping.opensInTerminal)
+            } header: {
+                Text("After checkout")
+            } footer: {
+                Text(mapping.opensInTerminal
+                     ? "A Terminal.app window opens in the folder and runs the block. The shell stays open afterwards."
+                     : "VS Code opens a workspace on the folder (stored in its .git/mmco) whose folderOpen task runs the block in the integrated terminal. VS Code runs it only in a trusted workspace, and only once you have answered “Allow and Run” to its automatic-tasks prompt. ⇧⌘B reruns it.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
     }

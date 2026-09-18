@@ -6,8 +6,32 @@ struct Mapping: Identifiable, Codable, Equatable {
     var path: String
     var preCheckout: String
     var postCheckout: String
+    /// Where the post-checkout script runs: "vscode" (folderOpen task) or "terminal" (Terminal.app).
+    var openIn: String = "vscode"
 
-    enum CodingKeys: String, CodingKey { case repo, path, preCheckout, postCheckout }
+    enum CodingKeys: String, CodingKey { case repo, path, preCheckout, postCheckout, openIn }
+
+    init(repo: String, path: String, preCheckout: String, postCheckout: String, openIn: String = "vscode") {
+        self.repo = repo
+        self.path = path
+        self.preCheckout = preCheckout
+        self.postCheckout = postCheckout
+        self.openIn = openIn
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        repo = try c.decodeIfPresent(String.self, forKey: .repo) ?? ""
+        path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+        preCheckout = try c.decodeIfPresent(String.self, forKey: .preCheckout) ?? ""
+        postCheckout = try c.decodeIfPresent(String.self, forKey: .postCheckout) ?? ""
+        openIn = try c.decodeIfPresent(String.self, forKey: .openIn) ?? "vscode"
+    }
+
+    var opensInTerminal: Bool {
+        get { openIn == "terminal" }
+        set { openIn = newValue ? "terminal" : "vscode" }
+    }
 }
 
 struct Config: Codable, Equatable {
