@@ -123,7 +123,7 @@ lookup_row() {
 }
 
 row_field() {
-  jq -r --arg repo "$1" --arg f "$2" '.mappings[] | select((.repo | ascii_downcase) == ($repo | ascii_downcase)) | .[$f] // ""' "$CONFIG" | head -n1
+  jq -r --arg repo "$1" --arg f "$2" 'first(.mappings[] | select((.repo | ascii_downcase) == ($repo | ascii_downcase))) | .[$f] // ""' "$CONFIG"
 }
 
 add_row() {
