@@ -120,14 +120,18 @@ struct BlockSection: View {
     @Binding var text: String
     let reset: () -> Void
 
+    /// Grows with the block so the form scrolls instead of a box inside the form, up to a cap.
+    private var editorHeight: CGFloat {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        return min(max(160, CGFloat(lines) * 16 + 28), 480)
+    }
+
     var body: some View {
         Section {
-            TextEditor(text: $text)
-                .font(.system(.body, design: .monospaced))
-                .frame(minHeight: 140)
-                .scrollContentBackground(.hidden)
-                .padding(4)
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+            ShellEditor(text: $text)
+                .frame(height: editorHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
         } header: {
             HStack {
                 Text(title)

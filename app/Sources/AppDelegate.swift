@@ -88,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         settingsWindow = window
         NSApp.setActivationPolicy(.regular)
+        MainMenu.install()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

@@ -66,6 +66,8 @@ Each run writes `~/Library/Application Support/mmco/runs/<owner__repo>/state.jso
 
 Both blocks are full shell (zsh), run inside the folder with `MMCO_REPO`, `MMCO_PATH`, `MMCO_BRANCH`, `MMCO_DEFAULT_BRANCH` set. Each has a **Reset to default** button. The config is plain JSON at `~/.config/mmco/config.json` (`mmco --config` opens it).
 
+The block editors highlight zsh (comments, strings, `$VAR`, keywords, commands, options), show line numbers, and follow the light or dark appearance. Shortcuts: the standard Edit menu (⌘Z ⇧⌘Z ⌘X ⌘C ⌘V ⌘A, ⌘F find bar), Tab / ⇧Tab indent by two spaces (a multi-line selection shifts every line), ⌘] / ⌘[ shift, ⌘/ toggles `#` comments, Return keeps the indentation. Paste is plain text and smart quotes are off.
+
 ### Default pre-checkout block
 
 Deletes local branches whose upstream is gone (remote branch deleted) and local branches whose PR GitHub reports as merged. The second rule exists because rebase- and squash-merges rewrite SHAs, so `git branch --merged` sees nothing. Never deletes the branch being checked out nor the default branch. Print it with `mmco --default-pre`.
