@@ -1,10 +1,11 @@
 import Cocoa
 import SwiftUI
 
-/// Faceless URL-scheme handler. `mmco://checkout?repo=<owner/repo>&branch=<branch>` runs the CLI
-/// and quits; `mmco://settings` shows the mapping table and quits when the window closes;
-/// `mmco://config` opens the JSON config in VS Code through the CLI.
+/// Faceless URL-scheme handler. `mmco://checkout?repo=<owner/repo>&branch=<branch>` starts a CLI
+/// run and quits; `mmco://settings` shows the mapping table and quits when the window closes;
+/// `mmco://config` and `mmco://log` open the JSON config and the log through the CLI.
 /// A plain launch (Finder, `open -a mmco`) with no URL behaves like `mmco://settings`.
+/// The same binary is also the Chrome native-messaging host, see main.swift and NativeHost.swift.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var settingsWindow: NSWindow?
     private var receivedURL = false
@@ -36,27 +37,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case "settings", "":
             showSettings()
         case "config":
-            openConfig()
+            runCLI(["--config"])
+        case "log":
+            runCLI(["--log"])
         default:
             fail("unknown mmco action: \(action)")
         }
     }
 
+    /// The run is detached (own session, /dev/null streams) and reports through its run folder,
+    /// so the app has nothing to wait for. Progress is visible in the Chrome extension and mmco --log.
     private func run(repo: String, branch: String) {
-        pendingRuns += 1
-        CLIRunner.run(repo: repo, branch: branch) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if case .failure(let error) = result { self.fail(error.localizedDescription) }
-                self.pendingRuns -= 1
-                if self.pendingRuns == 0 && self.settingsWindow == nil { NSApp.terminate(nil) }
-            }
+        do {
+            _ = try RunLauncher.launch(repo: repo, branch: branch)
+        } catch {
+            return fail(error.localizedDescription)
         }
+        if settingsWindow == nil { NSApp.terminate(nil) }
     }
 
-    private func openConfig() {
+    private func runCLI(_ arguments: [String]) {
         pendingRuns += 1
-        CLIRunner.run(arguments: ["--config"]) { [weak self] result in
+        CLIRunner.run(arguments: arguments) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 if case .failure(let error) = result { self.fail(error.localizedDescription) }

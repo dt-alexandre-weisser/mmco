@@ -15,15 +15,13 @@ enum CLIError: LocalizedError {
 }
 
 enum CLIRunner {
-    private static func loadConfig() -> Config? {
+    static func loadConfig() -> Config? {
         guard let data = try? Data(contentsOf: Paths.config) else { return nil }
         return try? JSONDecoder().decode(Config.self, from: data)
     }
 
-    static func run(repo: String, branch: String, completion: @escaping (Result<Void, Error>) -> Void) {
-        run(arguments: branch.isEmpty ? [repo] : [repo, branch], completion: completion)
-    }
-
+    /// Short CLI actions the app waits for (`--config`, `--log`). Checkout runs go through
+    /// RunLauncher instead, detached.
     static func run(arguments: [String], completion: @escaping (Result<Void, Error>) -> Void) {
         guard let cli = Paths.cli(from: loadConfig()) else { return completion(.failure(CLIError.notFound)) }
         let process = Process()

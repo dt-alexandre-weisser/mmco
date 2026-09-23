@@ -1,36 +1,40 @@
 #!/bin/zsh
-# mmco: fetch, clean and check out a branch of a mapped local repository, then open it in VS Code
-# or in a Terminal window. Single source of truth for the whole flow. mmco.app and the Chrome
-# extension only call this.
+# mmco: fetch, clean and check out a branch of a mapped local repository, open it in VS Code or in
+# a Terminal window, then run the post-checkout block. Single source of truth for the whole flow.
+# mmco.app (URL scheme + Chrome native-messaging host) and the Chrome extension only call this.
 #
 # USAGE
 #   mmco [--in vscode|terminal] <owner/repo> [branch]     check out [branch] of the mapped folder
 #   mmco [--in vscode|terminal] --path <folder> [branch]  same, on an explicit folder (no mapping)
 #   mmco --settings                 open the mapping table (mmco.app), falls back to --config
 #   mmco --config                   open the JSON config in VS Code
+#   mmco --log                      open ~/Library/Logs/mmco.log
+#   mmco --state <owner/repo>       print the last run's state (what the Chrome extension shows)
 #   mmco --default-pre              print the default pre-checkout block
 #   mmco --default-post <folder>    print the default post-checkout block for that folder
 #   mmco --help
 #
-# FLOW  (each step is logged to ~/Library/Logs/mmco.log)
+# FLOW  (each step is logged to ~/Library/Logs/mmco.log and mirrored in the run's state.json)
 #   1. resolve the mapping row (unknown repo: folder picker, saved with the default blocks)
 #   2. dirty tracked files: dialog Overwrite / Abort. Overwrite = git reset --hard, untracked kept
 #   3. git fetch --all --prune
 #   4. run the row's pre-checkout block (default: branch cleanup, see --default-pre)
 #   5. check out the branch, always hard-reset to origin. Unknown branch or none given: origin/<default>
 #      branch live in another worktree: warning dialog, then --ignore-other-worktrees
-#   6. write the row's post-checkout block (default: dependency install) to
-#      <repo>/.git/mmco/post-checkout.sh, then open it where the row says (--in overrides the row):
-#        vscode    <repo>/.git/mmco/<folder>.code-workspace, a workspace on the folder whose folderOpen
-#                  task runs the script in the integrated terminal. VS Code runs it only in a trusted
-#                  workspace and once you answered "Allow and Run" to its automatic-tasks prompt
-#                  (task.allowAutomaticTasks). ⇧⌘B reruns it any time.
-#        terminal  a Terminal.app window in the folder running the script
-#   7. notify
+#   6. open the folder where the row says (--in overrides the row): VS Code (`code <folder>`) or a
+#      Terminal.app window. MMCO_NO_OPEN=1 skips this step.
+#   7. run the row's post-checkout block (default: dependency install) inline. It is also written to
+#      <repo>/.git/mmco/post-checkout.sh so it can be rerun by hand. A block that never exits (a dev
+#      server) keeps the run alive: the Chrome extension shows it and can stop it.
+#   8. notify
 #
 # Blocks run with zsh, cwd = the repo, with MMCO_REPO, MMCO_PATH, MMCO_BRANCH, MMCO_DEFAULT_BRANCH set.
-# MMCO_NO_OPEN=1 runs the post-checkout script inline instead of opening anything, MMCO_ASSUME=go|abort
-# answers the dialogs (scripted use).
+# MMCO_ASSUME=go|abort answers the dialogs (scripted use).
+#
+# RUN STATE  ~/Library/Application Support/mmco/runs/<slug>/{state.json,run.log}, one folder per
+# repo (slug = owner/repo lower-cased, other characters doubled underscores). state.json is rewritten
+# at every phase; run.log is this run's output. mmco.app's native-messaging host tails both for the
+# extension, and stops a run with SIGTERM to its process group.
 
 set -o pipefail
 
@@ -39,12 +43,13 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mmco"
 CONFIG="$CONFIG_DIR/config.json"
 LOG_DIR="$HOME/Library/Logs"
 LOG="$LOG_DIR/mmco.log"
+RUNS_DIR="$HOME/Library/Application Support/mmco/runs"
 TITLE="mmco"
 
 # ---------------------------------------------------------------- defaults
 
 default_pre() {
-  cat <<'EOF'
+  cat <<'BLOCK'
 # mmco default pre-checkout block. Runs after `git fetch --all --prune`, inside the repo.
 # MMCO_DEFAULT_BRANCH = branch behind origin/HEAD, MMCO_BRANCH = branch about to be checked out.
 git checkout --quiet --detach "origin/$MMCO_DEFAULT_BRANCH"
@@ -65,7 +70,7 @@ if [ -n "$merged" ]; then
 else
   echo "mmco: gh unavailable or not authenticated, merged-PR cleanup skipped"
 fi
-EOF
+BLOCK
 }
 
 default_post() {
@@ -82,7 +87,7 @@ default_post() {
 # ---------------------------------------------------------------- helpers
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-die() { log "ERROR: $*"; notify "$*"; exit 1; }
+die() { log "ERROR: $*"; write_state failed "$*"; notify "$*"; exit 1; }
 
 # osascript escapes: backslash and double quote.
 as_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -99,9 +104,9 @@ confirm() {
     go) log "dialog auto-answered: $ok"; return 0 ;;
     abort) log "dialog auto-answered: Abort"; return 1 ;;
   esac
-  osascript >/dev/null 2>&1 <<EOF
+  osascript >/dev/null 2>&1 <<EOS
 display dialog "$(as_str "$msg")" with title "$TITLE" buttons {"Abort", "$(as_str "$ok")"} default button "Abort" cancel button "Abort" with icon caution
-EOF
+EOS
 }
 
 ensure_config() {
@@ -109,7 +114,7 @@ ensure_config() {
   [ -f "$CONFIG" ] || echo '{ "version": 1, "mappings": [] }' > "$CONFIG"
 }
 
-# Interactive shells get nvm and Homebrew from .zshrc; a launch from mmco.app does not.
+# Interactive shells get nvm and Homebrew from .zshrc; a launch from mmco.app or Chrome does not.
 setup_path() {
   export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/tools/bin:$PATH:/Applications/Visual Studio Code.app/Contents/Resources/app/bin"
   if [ -s "$HOME/.nvm/nvm.sh" ]; then
@@ -117,6 +122,9 @@ setup_path() {
     nvm use default >/dev/null 2>&1 || true
   fi
 }
+
+# Same rule as RunPaths.slug in the app: the two sides must agree on the folder name.
+slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#__#g'; }
 
 lookup_row() {
   jq -r --arg repo "$1" '.mappings[] | select((.repo | ascii_downcase) == ($repo | ascii_downcase)) | .path' "$CONFIG" | head -n1
@@ -151,6 +159,13 @@ open_config() {
   exit 0
 }
 
+print_state() {
+  local file="$RUNS_DIR/$(slug "$1")/state.json"
+  [ -f "$file" ] || { echo "no run recorded for $1" >&2; exit 1; }
+  cat "$file"
+  exit 0
+}
+
 run_block() {
   local name="$1" block="$2"
   [ -z "${block//[[:space:]]/}" ] && { log "$name block: empty, skipped"; return 0; }
@@ -162,7 +177,7 @@ run_block() {
 }
 
 # write_post_script <file> <block> <summary>: the post-checkout block as a standalone zsh script
-# that carries its environment, so a VS Code task or a Terminal window can run it later.
+# that carries its environment, so it can be rerun by hand later.
 write_post_script() {
   local file="$1" block="$2" summary="$3"
   mkdir -p "$(dirname "$file")"
@@ -180,29 +195,9 @@ write_post_script() {
   chmod +x "$file"
 }
 
-# write_workspace <file> <dir> <script>: a .code-workspace on <dir> whose folderOpen task runs <script>.
-# It lives inside <dir>/.git so that VS Code's workspace trust follows the folder's: the workspace
-# file itself is part of the trust check.
-write_workspace() {
-  local file="$1" dir="$2" script="$3"
-  mkdir -p "$(dirname "$file")"
-  jq -n --arg path "$dir" --arg name "$(basename "$dir")" --arg script "$script" '{
-    folders: [{ path: $path, name: $name }],
-    tasks: { version: "2.0.0", tasks: [{
-      label: "mmco post-checkout", type: "shell", command: "zsh", args: [$script],
-      runOptions: { runOn: "folderOpen" },
-      presentation: { reveal: "always", panel: "dedicated", focus: true, clear: true },
-      group: { kind: "build", isDefault: true },
-      problemMatcher: []
-    }] }
-  }' > "$file"
-}
-
 open_terminal() {
-  local dir="$1" script="$2"
   local cmd
-  cmd="cd $(printf '%q' "$dir")"
-  [ -n "$script" ] && cmd="$cmd && zsh $(printf '%q' "$script")"
+  cmd="cd $(printf '%q' "$1")"
   osascript -e 'tell application "Terminal"' -e 'activate' -e "do script \"$(as_str "$cmd")\"" -e 'end tell' >/dev/null
 }
 
@@ -210,14 +205,33 @@ open_vscode() {
   if command -v code >/dev/null 2>&1; then code "$1"; else open -a "Visual Studio Code" "$1"; fi
 }
 
-# VS Code ships task.allowAutomaticTasks off. "Allow and Run" on its prompt turns it on for good.
-VSCODE_SETTINGS="$HOME/Library/Application Support/Code/User/settings.json"
-vscode_auto_tasks_on() {
-  [ -f "$VSCODE_SETTINGS" ] || return 1
-  local v
-  v=$(jq -r '."task.allowAutomaticTasks" // empty' "$VSCODE_SETTINGS" 2>/dev/null) \
-    || v=$(grep -o '"task.allowAutomaticTasks"[[:space:]]*:[[:space:]]*"[a-z]*"' "$VSCODE_SETTINGS" | grep -o '"[a-z]*"$' | tr -d '"')
-  [ "$v" = on ]
+# ---------------------------------------------------------------- run state
+
+RUN_DIR="" STARTED="" LANDED="" PHASE="start" CHECKED_OUT=false
+WARNINGS=()
+
+# write_state <running|done|failed|stopped> [message] [exitCode]
+write_state() {
+  [ -n "$RUN_DIR" ] || return 0
+  local tmp="$RUN_DIR/state.json.tmp"
+  jq -n --arg repo "$REPO" --arg path "$DIR" --arg branch "$BRANCH" --arg landed "$LANDED" \
+    --arg phase "$PHASE" --arg status "$1" --arg message "${2:-}" --argjson exitCode "${3:-null}" \
+    --argjson checkedOut "$CHECKED_OUT" --argjson pid $$ \
+    --arg startedAt "$STARTED" --arg updatedAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg warnings "$(printf '%s\n' "${WARNINGS[@]}")" \
+    '{ repo: $repo, path: $path, branch: $branch, landed: $landed, phase: $phase, status: $status,
+       message: $message, checkedOut: $checkedOut, pid: $pid, exitCode: $exitCode,
+       startedAt: $startedAt, updatedAt: $updatedAt,
+       warnings: ($warnings | split("\n") | map(select(length > 0))) }' > "$tmp" 2>/dev/null \
+    && mv "$tmp" "$RUN_DIR/state.json"
+}
+
+phase() { PHASE="$1"; write_state running; log "phase: $1"; }
+
+on_term() {
+  log "stopped (SIGTERM)"
+  write_state stopped "stopped"
+  exit 143
 }
 
 usage() { sed -n '2,/^[^#]/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -234,6 +248,8 @@ case "${1:-}" in
   -h|--help) usage 0 ;;
   --settings) open_settings ;;
   --config) open_config ;;
+  --log) ensure_config; touch "$LOG"; open "$LOG"; exit 0 ;;
+  --state) print_state "${2:?owner/repo required}" ;;
   --default-pre) default_pre; exit 0 ;;
   --default-post) default_post "${2:?folder required}"; exit 0 ;;
   --path) DIR="${2:?folder required}"; BRANCH="${3:-}" ;;
@@ -244,11 +260,19 @@ esac
 
 ensure_config
 setup_path
-exec > >(tee -a "$LOG") 2>&1
-log "run: repo='${REPO:-<path>}' path='${DIR:-<mapped>}' branch='${BRANCH:-<default>}'"
+RUN_DIR="$RUNS_DIR/$(slug "${REPO:-path:$DIR}")"
+mkdir -p "$RUN_DIR"
+: > "$RUN_DIR/run.log"
+STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+# tee ignores TERM so that the lines written by on_term still reach the logs.
+exec > >(trap '' TERM; tee -a "$LOG" "$RUN_DIR/run.log") 2>&1
+trap on_term TERM INT HUP
+log "run: repo='${REPO:-<path>}' path='${DIR:-<mapped>}' branch='${BRANCH:-<default>}' pid=$$"
+write_state running
 
 # ---------------------------------------------------------------- 1. mapping
 
+phase mapping
 if [ -z "$DIR" ]; then
   DIR=$(lookup_row "$REPO")
   if [ -z "$DIR" ]; then
@@ -267,6 +291,7 @@ if [ -f .nvmrc ] && command -v nvm >/dev/null 2>&1; then nvm use >/dev/null 2>&1
 
 # ---------------------------------------------------------------- 2. dirty tree
 
+phase dirty-check
 DIRTY=$(git status --porcelain --untracked-files=no)
 if [ -n "$DIRTY" ]; then
   log "dirty tracked files:"; echo "$DIRTY"
@@ -285,6 +310,7 @@ fi
 
 # ---------------------------------------------------------------- 3. fetch
 
+phase fetch
 git fetch --all --prune --quiet || die "git fetch failed in $DIR"
 DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's:^origin/::')
 if [ -z "$DEFAULT_BRANCH" ]; then
@@ -297,12 +323,13 @@ log "default branch: $DEFAULT_BRANCH"
 
 # ---------------------------------------------------------------- 4. pre-checkout block
 
+phase pre-checkout
 if [ -n "$REPO" ]; then PRE=$(row_field "$REPO" preCheckout); else PRE=$(default_pre); fi
 run_block "pre-checkout" "$PRE" || die "pre-checkout block failed (see $LOG)"
 
 # ---------------------------------------------------------------- 5. checkout
 
-WARNINGS=()
+phase checkout
 TARGET="$BRANCH"
 if [ -n "$TARGET" ]; then
   HAS_REMOTE=$(git rev-parse --verify --quiet "refs/remotes/origin/$TARGET" >/dev/null && echo 1)
@@ -346,51 +373,57 @@ Continuing forces the branch into $DIR as well. The two checkouts then share one
   LANDED="$TARGET"
   [ -z "$HAS_REMOTE" ] && WARNINGS+=("$TARGET has no origin counterpart, local branch kept as is")
 fi
+CHECKED_OUT=true
 log "checked out: $LANDED"
-
-# ---------------------------------------------------------------- 6. post-checkout script + open
-
-if [ -n "$REPO" ]; then POST=$(row_field "$REPO" postCheckout); else POST=$(default_post "$DIR"); fi
-[ -n "$OPEN_IN" ] || { [ -n "$REPO" ] && OPEN_IN=$(row_field "$REPO" openIn); }
-[ "$OPEN_IN" = terminal ] || OPEN_IN=vscode
-SUMMARY="$(basename "$DIR") on $LANDED"
-MMCO_DIR="$(git rev-parse --absolute-git-dir)/mmco"
-SCRIPT=""
-if [ -z "${MMCO_NO_OPEN:-}" ] && [ "$OPEN_IN" = vscode ] && [ -n "${POST//[[:space:]]/}" ] && ! vscode_auto_tasks_on; then
-  WARNINGS+=("VS Code runs the post-checkout block once you answer Allow and Run to its automatic-tasks prompt (⇧⌘B runs it now)")
-fi
 for w in "${WARNINGS[@]}"; do log "WARNING: $w"; done
 
+SUMMARY="$(basename "$DIR") on $LANDED"
+MMCO_DIR="$(git rev-parse --absolute-git-dir)/mmco"
+rm -f "$MMCO_DIR"/*.code-workspace(N)
+
+# ---------------------------------------------------------------- 6. open
+
+phase open
+[ -n "$OPEN_IN" ] || { [ -n "$REPO" ] && OPEN_IN=$(row_field "$REPO" openIn); }
+[ "$OPEN_IN" = terminal ] || OPEN_IN=vscode
+if [ -n "${MMCO_NO_OPEN:-}" ]; then
+  WHERE="not opened (MMCO_NO_OPEN)"
+elif [ "$OPEN_IN" = terminal ]; then
+  open_terminal "$DIR"; WHERE="Terminal"
+else
+  open_vscode "$DIR"; WHERE="VS Code"
+fi
+log "opened in $WHERE"
+
+# ---------------------------------------------------------------- 7. post-checkout block
+
+if [ -n "$REPO" ]; then POST=$(row_field "$REPO" postCheckout); else POST=$(default_post "$DIR"); fi
+RC=0
 if [ -n "${POST//[[:space:]]/}" ]; then
   SCRIPT="$MMCO_DIR/post-checkout.sh"
-  write_post_script "$SCRIPT" "$POST" "$SUMMARY${WARNINGS:+. $(printf '%s. ' "${WARNINGS[@]}")}"
+  write_post_script "$SCRIPT" "$POST" "$SUMMARY"
   log "post-checkout script: $SCRIPT"
+  notify "${WARNINGS:+$(printf '%s. ' "${WARNINGS[@]}")}Checked out, post-checkout running." "$SUMMARY"
+  phase post-checkout
+  zsh "$SCRIPT"
+  RC=$?
+  log "post-checkout block: exit $RC"
 else
   log "post-checkout block: empty, skipped"
 fi
 
-if [ -n "${MMCO_NO_OPEN:-}" ]; then
-  if [ -n "$SCRIPT" ]; then zsh "$SCRIPT" || WARNINGS+=("post-checkout block failed (see $LOG)"); fi
-  WHERE="not opened (MMCO_NO_OPEN)"
-elif [ "$OPEN_IN" = terminal ]; then
-  open_terminal "$DIR" "$SCRIPT"
-  WHERE="Terminal"
-elif [ -n "$SCRIPT" ]; then
-  WS="$MMCO_DIR/$(basename "$DIR").code-workspace"
-  write_workspace "$WS" "$DIR" "$SCRIPT"
-  open_vscode "$WS"
-  WHERE="VS Code"
-else
-  open_vscode "$DIR"
-  WHERE="VS Code"
+# ---------------------------------------------------------------- 8. notify
+
+PHASE=end
+if [ "$RC" -ne 0 ]; then
+  write_state failed "post-checkout block exit $RC" "$RC"
+  notify "Post-checkout block failed (exit $RC), see mmco --log." "$SUMMARY"
+  log "done with errors: $SUMMARY ($WHERE)"
+  exit "$RC"
 fi
-
-# ---------------------------------------------------------------- 7. notify
-
+write_state done "" 0
 if [ ${#WARNINGS[@]} -gt 0 ]; then
-  notify "$(printf '%s. ' "${WARNINGS[@]}")" "$SUMMARY"
-elif [ -n "$SCRIPT" ]; then
-  notify "Post-checkout running in $WHERE." "$SUMMARY"
+  notify "$(printf '%s. ' "${WARNINGS[@]}")Ready in $WHERE." "$SUMMARY"
 else
   notify "Ready in $WHERE." "$SUMMARY"
 fi

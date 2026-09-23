@@ -1,6 +1,8 @@
 // Detects the repo + branch on GitHub pages, injects a "Checkout locally" button next to the
-// branch, and answers the popup's detect/open messages. Everything ends in an mmco:// URL that
-// the macOS app handles.
+// branch, and answers the popup's detect/open messages. A click goes to the background service
+// worker, which talks to mmco.app over native messaging; the button then mirrors the run's state
+// (spinner while it runs, then checked out / failed). Without the host it falls back to an
+// mmco:// URL.
 (() => {
   const BUTTON_CLASS = 'mmco-button';
 
@@ -17,6 +19,31 @@
     a.click();
     a.remove();
   };
+
+  // ---------------------------------------------------------------- background port
+
+  let port = null;
+  const buttons = new Set();
+
+  const connect = () => {
+    if (port) return port;
+    try {
+      port = chrome.runtime.connect({ name: 'mmco' });
+    } catch {
+      return null; // extension reloaded: this page's context is gone
+    }
+    port.onMessage.addListener((message) => { for (const button of buttons) button.receive(message); });
+    port.onDisconnect.addListener(() => { port = null; });
+    return port;
+  };
+
+  const send = (message) => {
+    const p = connect();
+    if (!p) return false;
+    try { p.postMessage(message); return true; } catch { port = null; return false; }
+  };
+
+  // ---------------------------------------------------------------- detection
 
   const repoFromPath = () => {
     const m = location.pathname.match(/^\/([^/]+)\/([^/]+)/);
@@ -75,30 +102,102 @@
     return { repo, branch: '', kind: 'repo' };
   };
 
+  // ---------------------------------------------------------------- button
+
+  const LABELS = {
+    idle: 'Checkout locally',
+    running: 'Checking out…',
+    post: 'Post-checkout…',
+    done: 'Checked out',
+    failed: 'Failed',
+    stopped: 'Stopped',
+  };
+  const FALLBACK_SPIN_MS = 4000;
+
+  const sameRun = (state, repo, branch) =>
+    (state.repo || '').toLowerCase() === repo.toLowerCase() && (state.branch || '') === branch;
+
   const makeButton = (repo, branch, compact) => {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = BUTTON_CLASS + (compact ? ' mmco-button--compact' : '');
-    button.title = `mmco: check out ${branch} in your local ${repo}`;
-    button.textContent = compact ? 'mmco' : 'Checkout locally';
+    button.dataset.state = 'idle';
+    const icon = document.createElement('span');
+    icon.className = 'mmco-icon';
+    const label = document.createElement('span');
+    label.className = 'mmco-label';
+    button.append(icon, label);
+
+    let fallbackTimer = 0;
+    const set = (state, text, title) => {
+      button.dataset.state = state;
+      label.textContent = compact ? 'mmco' : text;
+      button.title = title || `mmco: check out ${branch} in your local ${repo}`;
+    };
+    set('idle', LABELS.idle);
+
+    const entry = {
+      button,
+      receive(message) {
+        if (message.type === 'run' && message.state) {
+          const state = message.state;
+          if (!sameRun(state, repo, branch)) return;
+          window.clearTimeout(fallbackTimer);
+          const detail = [state.phase && `phase: ${state.phase}`, state.message, ...(state.warnings || [])].filter(Boolean).join('\n');
+          switch (state.status) {
+            case 'running':
+              set('running', state.phase === 'post-checkout' ? LABELS.post : LABELS.running, `mmco: ${detail}`);
+              break;
+            case 'done':
+              set('done', LABELS.done, `mmco: ${state.landed || branch} checked out in ${state.path || repo}${detail ? '\n' + detail : ''}`);
+              break;
+            case 'failed':
+              set('failed', LABELS.failed, `mmco: ${detail || 'failed'}\nClick to retry.`);
+              break;
+            case 'stopped':
+              set('stopped', LABELS.stopped, 'mmco: run stopped. Click to retry.');
+              break;
+            default:
+              set('idle', LABELS.idle);
+          }
+        } else if (message.type === 'checkout-fallback' && sameRun(message, repo, branch)) {
+          openUrl(checkoutUrl(repo, branch));
+          set('running', LABELS.running, 'mmco: handed to mmco.app (no progress without the native host)');
+          window.clearTimeout(fallbackTimer);
+          fallbackTimer = window.setTimeout(() => set('idle', LABELS.idle), FALLBACK_SPIN_MS);
+        }
+      },
+    };
+    buttons.add(entry);
+
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      openUrl(checkoutUrl(repo, branch));
+      if (button.dataset.state === 'running') return;
+      set('running', LABELS.running, 'mmco: starting…');
+      if (!send({ type: 'checkout', repo, branch })) {
+        openUrl(checkoutUrl(repo, branch));
+        fallbackTimer = window.setTimeout(() => set('idle', LABELS.idle), FALLBACK_SPIN_MS);
+      }
     });
     return button;
   };
 
+  // Buttons removed by GitHub's re-renders stay in `buttons` until the next sweep.
+  const sweep = () => { for (const entry of buttons) if (!entry.button?.isConnected) buttons.delete(entry); };
+
   const injectPullRequest = () => {
     const found = detect();
-    if (!found || found.kind !== 'pull' || !found.anchor || !found.branch) return;
-    if (found.anchor.querySelector(`.${BUTTON_CLASS}`)) return;
+    if (!found || found.kind !== 'pull' || !found.anchor || !found.branch) return false;
+    if (found.anchor.querySelector(`.${BUTTON_CLASS}`)) return false;
     found.anchor.appendChild(makeButton(found.repo, found.branch, false));
+    return found.repo;
   };
 
   const injectBranchList = () => {
     const repo = repoFromPath();
-    if (!repo || !/^\/[^/]+\/[^/]+\/branches/.test(location.pathname)) return;
+    if (!repo || !/^\/[^/]+\/[^/]+\/branches/.test(location.pathname)) return false;
+    let added = false;
     for (const link of document.querySelectorAll('a[href*="/tree/"]')) {
       const row = link.closest('tr, li, [class*="BranchRow"]');
       if (!row || row.querySelector(`.${BUTTON_CLASS}`)) continue;
@@ -107,12 +206,14 @@
       const branch = decodeBranch(m[1]);
       if (link.textContent.trim() !== branch) continue;
       link.insertAdjacentElement('afterend', makeButton(repo, branch, true));
+      added = true;
     }
+    return added ? repo : false;
   };
 
   const inject = () => {
-    injectPullRequest();
-    injectBranchList();
+    const repo = injectPullRequest() || injectBranchList();
+    if (repo) send({ type: 'status', repo });
   };
 
   globalThis.chrome?.runtime?.onMessage?.addListener((message, _sender, sendResponse) => {
@@ -130,7 +231,7 @@
   let scheduled = 0;
   const observer = new MutationObserver(() => {
     if (scheduled) return;
-    scheduled = window.setTimeout(() => { scheduled = 0; inject(); }, 250);
+    scheduled = window.setTimeout(() => { scheduled = 0; sweep(); inject(); }, 250);
   });
   observer.observe(document.documentElement, { childList: true, subtree: true });
   inject();

@@ -6,7 +6,7 @@ struct Mapping: Identifiable, Codable, Equatable {
     var path: String
     var preCheckout: String
     var postCheckout: String
-    /// Where the post-checkout script runs: "vscode" (folderOpen task) or "terminal" (Terminal.app).
+    /// Where the folder opens after the checkout: "vscode" (`code <folder>`) or "terminal" (a Terminal.app window).
     var openIn: String = "vscode"
 
     enum CodingKeys: String, CodingKey { case repo, path, preCheckout, postCheckout, openIn }
