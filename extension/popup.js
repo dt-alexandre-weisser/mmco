@@ -23,6 +23,19 @@ const openUrl = async (tab, url) => {
   await chrome.tabs.update(tab.id, { url });
 };
 
+// "Slack it" message, edited here and read by the content script on each click.
+const SLACK_TEMPLATE_DEFAULT = ':approved_stamp: {url} plz';
+
+const initSlackTemplate = async () => {
+  const field = $('slack-template');
+  field.placeholder = SLACK_TEMPLATE_DEFAULT;
+  const { slackTemplate } = await chrome.storage.sync.get('slackTemplate');
+  field.value = slackTemplate || SLACK_TEMPLATE_DEFAULT;
+  field.addEventListener('input', () => {
+    chrome.storage.sync.set({ slackTemplate: field.value.trim() });
+  });
+};
+
 const STATUS_TEXT = { none: '', running: 'running', done: 'checked out', failed: 'failed', stopped: 'stopped' };
 
 const render = (state) => {
@@ -95,4 +108,5 @@ const init = async () => {
   $('log').addEventListener('click', () => { port.postMessage({ type: 'open-log', repo: found?.repo || '' }); });
 };
 
+initSlackTemplate();
 init();

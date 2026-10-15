@@ -9,7 +9,7 @@
     .row { display: flex; justify-content: space-between; gap: 8px; margin: 4px 0; }
     .label { color: #59636e; flex: none; }
     .value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; text-align: right; }
-    input { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 5px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; border: 1px solid #d0d7de; border-radius: 6px; }
+    input, textarea { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 5px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; border: 1px solid #d0d7de; border-radius: 6px; }
     .actions { display: flex; gap: 8px; margin-top: 10px; }
     button { flex: 1; padding: 6px 0; font-weight: 600; color: #fff; background: #0969da; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
     button:disabled { background: #8c959f; cursor: default; }
@@ -27,6 +27,9 @@
     .hint { margin: 8px 0 0; color: #59636e; font-size: 12px; }
     .error { margin: 8px 0 0; color: #cf222e; font-size: 12px; }
     .error:empty { display: none; }
+    textarea { resize: vertical; margin-top: 4px; }
+    .section { margin-top: 12px; padding-top: 8px; border-top: 1px solid #d0d7de; }
+    .section label { color: #59636e; }
     footer { margin-top: 12px; padding-top: 8px; border-top: 1px solid #d0d7de; display: flex; justify-content: space-between; font-size: 12px; }
     a { color: #0969da; text-decoration: none; cursor: pointer; }
   </style>
@@ -44,6 +47,11 @@
   <pre id="tail"></pre>
   <p class="hint" id="hint"></p>
   <p class="error" id="error"></p>
+  <div class="section">
+    <label for="slack-template">Slack it message</label>
+    <textarea id="slack-template" rows="2" spellcheck="false"></textarea>
+    <p class="hint"><code>{url}</code> is replaced by the pull request link. Empty = default.</p>
+  </div>
   <footer>
     <a id="settings">Settings…</a>
     <a id="config">Config file</a>

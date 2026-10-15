@@ -181,6 +181,57 @@
     return button;
   };
 
+  // "Slack it": copies the message set in the popup (default ":approved_stamp: <url> plz") to the
+  // clipboard, to paste in Slack. {url} in the message is replaced by the pull request link.
+  const SLACK_RESET_MS = 3000;
+  const SLACK_TEMPLATE_DEFAULT = ':approved_stamp: {url} plz';
+
+  const slackMessage = async (url) => {
+    let template = '';
+    try { ({ slackTemplate: template } = await chrome.storage.sync.get('slackTemplate')); } catch { /* extension reloaded */ }
+    return (template || SLACK_TEMPLATE_DEFAULT).replaceAll('{url}', url);
+  };
+
+  const makeSlackButton = (url) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `${BUTTON_CLASS} mmco-button--slack`;
+    const icon = document.createElement('span');
+    icon.className = 'mmco-icon';
+    const label = document.createElement('span');
+    label.className = 'mmco-label';
+    button.append(icon, label);
+
+    let resetTimer = 0;
+    const set = (state, labelText, title) => {
+      button.dataset.state = state;
+      label.textContent = labelText;
+      button.title = title;
+    };
+    const idle = () => set('idle', 'Slack it', 'mmco: copy the Slack message for this pull request (edit it in the mmco popup)');
+    idle();
+
+    button.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      window.clearTimeout(resetTimer);
+      try {
+        const text = await slackMessage(url);
+        await navigator.clipboard.writeText(text);
+        set('done', 'Copied', `mmco: "${text}" copied`);
+      } catch (error) {
+        set('failed', 'Failed', `mmco: clipboard refused: ${error?.message || error}`);
+      }
+      resetTimer = window.setTimeout(idle, SLACK_RESET_MS);
+    });
+    return button;
+  };
+
+  const prUrl = () => {
+    const m = location.pathname.match(/^\/[^/]+\/[^/]+\/pull\/\d+/);
+    return m ? `${location.origin}${m[0]}` : null;
+  };
+
   // Buttons removed by GitHub's re-renders stay in `buttons` until the next sweep.
   const sweep = () => { for (const entry of buttons) if (!entry.button?.isConnected) buttons.delete(entry); };
 
@@ -189,6 +240,8 @@
     if (!found || found.kind !== 'pull' || !found.anchor || !found.branch) return false;
     if (found.anchor.querySelector(`.${BUTTON_CLASS}`)) return false;
     found.anchor.appendChild(makeButton(found.repo, found.branch, false));
+    const url = prUrl();
+    if (url) found.anchor.appendChild(makeSlackButton(url));
     return found.repo;
   };
 
