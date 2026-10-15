@@ -59,16 +59,14 @@
   };
 
   // PR header, current React layout: the head branch is the BranchName link whose wrapper holds
-  // the "copy head branch name" icon button as a direct child. The base branch sits one level up,
-  // in the container that wraps everything, so a descendant match would pick it. Classic layout:
-  // .head-ref.
+  // the "copy head branch name" icon button as a direct child; the base branch has none. The
+  // header's container class is a hashed CSS-module name that GitHub renames, so the whole page
+  // is searched. The first match is the visible header, the second the hidden sticky one.
+  // Classic layout: .head-ref.
   const prHead = () => {
-    const container = document.querySelector('[class*="PullRequestHeaderBranches"]');
-    if (container) {
-      for (const link of container.querySelectorAll('a[data-component="BranchName"]')) {
-        if (link.parentElement.querySelector(':scope > button .octicon-copy')) {
-          return { branch: link.textContent.trim(), anchor: link.parentElement };
-        }
+    for (const link of document.querySelectorAll('a[data-component="BranchName"]')) {
+      if (link.parentElement.querySelector(':scope > button .octicon-copy')) {
+        return { branch: link.textContent.trim(), anchor: link.parentElement };
       }
     }
     const classic = document.querySelector('.head-ref');
