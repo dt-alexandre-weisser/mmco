@@ -36,6 +36,24 @@ const initSlackTemplate = async () => {
   });
 };
 
+// Control / Logs tabs. The log tail only has a scroll height while its panel is shown, so it is
+// pinned to the bottom again on every switch to it.
+const scrollTail = () => { $('tail').scrollTop = $('tail').scrollHeight; };
+
+const initTabs = () => {
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  for (const tab of tabs) {
+    tab.addEventListener('click', () => {
+      for (const other of tabs) {
+        const selected = other === tab;
+        other.setAttribute('aria-selected', String(selected));
+        $(other.getAttribute('aria-controls')).hidden = !selected;
+      }
+      if (tab.id === 'tab-logs') scrollTail();
+    });
+  }
+};
+
 const STATUS_TEXT = { none: '', running: 'running', done: 'checked out', failed: 'failed', stopped: 'stopped' };
 
 const render = (state) => {
@@ -45,7 +63,7 @@ const render = (state) => {
   $('phase').textContent = status === 'none' ? '–' : (state.phase || '–');
   if (state?.branch) $('branch').textContent = state.branch;
   $('tail').textContent = (state?.tail || []).join('\n');
-  $('tail').scrollTop = $('tail').scrollHeight;
+  scrollTail();
   const notes = [state?.message, ...(state?.warnings || [])].filter(Boolean);
   if (notes.length) $('hint').textContent = notes.join(' ');
 };
@@ -108,5 +126,6 @@ const init = async () => {
   $('log').addEventListener('click', () => { port.postMessage({ type: 'open-log', repo: found?.repo || '' }); });
 };
 
+initTabs();
 initSlackTemplate();
 init();
