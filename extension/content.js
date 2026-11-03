@@ -182,14 +182,20 @@
   };
 
   // "Slack it": copies the message set in the popup (default ":approved_stamp: <url> plz") to the
-  // clipboard, to paste in Slack. {url} in the message is replaced by the pull request link.
+  // clipboard, to paste in Slack. {url} in the message is replaced by the pull request link, and
+  // each {rdm} by its own random emoji, drawn again on every copy.
   const SLACK_RESET_MS = 3000;
   const SLACK_TEMPLATE_DEFAULT = ':approved_stamp: {url} plz';
+  const SLACK_EMOJIS = [
+    '🙏', '🚀', '✨', '🔥', '👀', '🎉', '💪', '🙌', '⚡', '🌟', '🍀', '🦄', '🐙', '🦊', '🐢', '🍕',
+    '🍩', '☕', '🌈', '🎯', '🧠', '💡', '🛠️', '📦', '🔍', '🥳', '😇', '🤞', '👍', '💯', '🫶', '🌻',
+  ];
+  const randomEmoji = () => SLACK_EMOJIS[Math.floor(Math.random() * SLACK_EMOJIS.length)];
 
   const slackMessage = async (url) => {
     let template = '';
     try { ({ slackTemplate: template } = await chrome.storage.sync.get('slackTemplate')); } catch { /* extension reloaded */ }
-    return (template || SLACK_TEMPLATE_DEFAULT).replaceAll('{url}', url);
+    return (template || SLACK_TEMPLATE_DEFAULT).replaceAll('{url}', url).replaceAll('{rdm}', randomEmoji);
   };
 
   const makeSlackButton = (url) => {
